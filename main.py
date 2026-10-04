@@ -5,7 +5,6 @@ import sqlite3
 from datetime import datetime
 
 from pyrogram import Client
-from pyrogram.types import Message
 
 # ==== Конфиг из переменных окружения ====
 API_ID = int(os.environ["TELEGRAM_API_ID"])
@@ -68,35 +67,21 @@ def parse_top(text):
 
 
 async def fetch_top(app):
+    # 1. /start
     await app.send_message(ANICARD_USERNAME, "/start")
     await asyncio.sleep(3)
 
-    clan_btn_msg = None
-    async for msg in app.get_chat_history(ANICARD_USERNAME, limit=10):
-        if msg.reply_markup and msg.reply_markup.inline_keyboard:
-            flat = [b.text for row in msg.reply_markup.inline_keyboard for b in row]
-            if any("Кланы" in t for t in flat):
-                clan_btn_msg = msg
-                break
-    if not clan_btn_msg:
-        raise RuntimeError("Не найдено меню с кнопкой «Кланы»")
-    await clan_btn_msg.click("🛡 Кланы")
+    # 2. 🛡 Кланы (как текст, кнопка reply — бот её примет)
+    await app.send_message(ANICARD_USERNAME, "🛡 Кланы")
     await asyncio.sleep(3)
 
-    top_btn_msg = None
-    async for msg in app.get_chat_history(ANICARD_USERNAME, limit=10):
-        if msg.reply_markup and msg.reply_markup.inline_keyboard:
-            flat = [b.text for row in msg.reply_markup.inline_keyboard for b in row]
-            if any("Топ кланов" in t for t in flat):
-                top_btn_msg = msg
-                break
-    if not top_btn_msg:
-        raise RuntimeError("Не найдено меню с кнопкой «Топ кланов»")
-    await top_btn_msg.click("🏆 Топ кланов")
+    # 3. 🏆 Топ кланов (тоже как текст)
+    await app.send_message(ANICARD_USERNAME, "🏆 Топ кланов")
     await asyncio.sleep(3)
 
+    # 4. Ищем сообщение с топом в истории
     top_text_msg = None
-    async for msg in app.get_chat_history(ANICARD_USERNAME, limit=10):
+    async for msg in app.get_chat_history(ANICARD_USERNAME, limit=15):
         if msg.text and "Топ кланов по очкам" in msg.text:
             top_text_msg = msg
             break
