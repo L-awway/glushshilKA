@@ -6,11 +6,10 @@ from datetime import datetime
 
 from pyrogram import Client
 
-# ==== Конфиг из переменных окружения ====
 API_ID = int(os.environ["TELEGRAM_API_ID"])
 API_HASH = os.environ["TELEGRAM_API_HASH"]
 SESSION = os.environ["SESSION_STRING"]
-OWNER_ID = int(os.environ["OWNER_ID"])
+OWNER = os.environ["OWNER_ID"]  # @username или ID — строка
 
 ANICARD_USERNAME = "anicardplaybot"
 DB_PATH = "anicard.db"
@@ -67,19 +66,15 @@ def parse_top(text):
 
 
 async def fetch_top(app):
-    # 1. /start
     await app.send_message(ANICARD_USERNAME, "/start")
     await asyncio.sleep(3)
 
-    # 2. 🛡 Кланы (как текст, кнопка reply — бот её примет)
     await app.send_message(ANICARD_USERNAME, "🛡 Кланы")
     await asyncio.sleep(3)
 
-    # 3. 🏆 Топ кланов (тоже как текст)
     await app.send_message(ANICARD_USERNAME, "🏆 Топ кланов")
     await asyncio.sleep(3)
 
-    # 4. Ищем сообщение с топом в истории
     top_text_msg = None
     async for msg in app.get_chat_history(ANICARD_USERNAME, limit=15):
         if msg.text and "Топ кланов по очкам" in msg.text:
@@ -91,7 +86,10 @@ async def fetch_top(app):
 
 
 async def send_report(app, text):
-    await app.send_message(OWNER_ID, text)
+    try:
+        await app.send_message(OWNER, text)
+    except Exception as e:
+        print(f"Не удалось отправить отчёт: {e}")
 
 
 async def main():
