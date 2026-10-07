@@ -27,7 +27,7 @@ self_request = False
 
 # цепочка сообщений дня
 chain_message_ids = []      # [msg_id_1, msg_id_2, ...]
-current_chain_text = ""     # буфер последнего сообщения
+current_chain_sections = [] # список секций текущего сообщения
 current_chain_msg_id = None # id последнего сообщения
 last_chain_date = None      # дата цепочки
 
@@ -203,7 +203,7 @@ def parse_top(text):
 
 # ==== Формат секции ====
 def format_snapshot_section(ts, deltas):
-    """Только секция снапшота — без топа сезона и дня."""
+    """Только секция снапшота."""
     dt = datetime.fromisoformat(ts).astimezone(MSK).strftime("%H:%M")
     lines = [f"📊 <b>[{dt} МСК]</b>"]
     for place, name, kind, d, pts in deltas:
@@ -220,7 +220,7 @@ def format_snapshot_section(ts, deltas):
 
 
 def format_header():
-    """Шапка: топ сезона + топ дня на текущий момент."""
+    """Свежая шапка: топ сезона + топ дня."""
     lines = []
     top = get_current_top()
     if top:
@@ -238,9 +238,18 @@ def format_header():
 
     return "\n".join(lines)
 
+
+def build_chain_text(date_str, sections, is_continuation=False):
+    """Собирает полный текст: шапка + список секций."""
+    suffix = " (продолжение)" if is_continuation else ""
+    header_date = f"🗓 <b>История Anicard — {date_str}{suffix}</b>"
+    header = format_header()
+    body = "\n\n".join(sections)
+    return f"{header_date}\n\n{header}\n\n{body}"
+
 # ==== Цепочка сообщений ====
 async def append_to_chain(section: str):
-    global current_chain_text, current_chain_msg_id, last_chain_date
+    global current_chain_sections, current_chain_msg_id, last_chain_date
 
     today = today_msk_date()
     if last_chain_date is not None and last_chain_date != today:
@@ -248,15 +257,16 @@ async def append_to_chain(section: str):
     if last_chain_date is None:
         last_chain_date = today
 
-    # первое сообщение дня — с шапкой
+    date_str = today.strftime("%d.%m.%Y")
+
+    # первое сообщение дня — создаём
     if current_chain_msg_id is None:
-        header_date = f"🗓 <b>История Anicard — {today.strftime('%d.%m.%Y')}</b>"
-        header = format_header()
-        current_chain_text = f"{header_date}\n\n{header}\n\n{section}"
+        current_chain_sections = [section]
+        text = build_chain_text(date_str, current_chain_sections)
         try:
             msg = await bot.send_message(
                 LEADER_CHAT_ID,
-                current_chain_text,
+                text,
                 parse_mode=ParseMode.HTML,
                 protect_content=True,
                 disable_notification=True,
@@ -268,41 +278,43 @@ async def append_to_chain(section: str):
             print(f"Не удалось создать сообщение цепочки: {e}")
         return
 
-    new_text = current_chain_text + "\n\n" + section
-    if len(new_text) > MAX_MESSAGE_LEN:
-        # создаём новое сообщение — снова с шапкой
-        header_date = f"🗓 <b>История Anicard — {today.strftime('%d.%m.%Y')} (продолжение)</b>"
-        header = format_header()
-        new_text = f"{header_date}\n\n{header}\n\n{section}"
+    # пробуем добавить секцию и пересобрать текст
+    candidate_sections = current_chain_sections + [section]
+    candidate_text = build_chain_text(date_str, candidate_sections)
+
+    if len(candidate_text) > MAX_MESSAGE_LEN:
+        # переполнение — создаём новое сообщение с шапкой и одной секцией
+        current_chain_sections = [section]
+        text = build_chain_text(date_str, current_chain_sections, is_continuation=True)
         try:
             msg = await bot.send_message(
                 LEADER_CHAT_ID,
-                new_text,
+                text,
                 parse_mode=ParseMode.HTML,
                 protect_content=True,
                 disable_notification=True,
             )
             current_chain_msg_id = msg.id
-            current_chain_text = new_text
             chain_message_ids.append(msg.id)
             await bot.pin_chat_message(LEADER_CHAT_ID, msg.id, disable_notification=True)
         except Exception as e:
             print(f"Не удалось создать продолжение цепочки: {e}")
     else:
-        current_chain_text = new_text
+        current_chain_sections = candidate_sections
         try:
             await bot.edit_message_text(
                 chat_id=LEADER_CHAT_ID,
                 message_id=current_chain_msg_id,
-                text=current_chain_text,
+                text=candidate_text,
                 parse_mode=ParseMode.HTML,
             )
         except Exception as e:
             print(f"Не удалось отредактировать цепочку: {e}")
-
+            
+            
 async def start_new_chain_day():
     """Открепляет все сообщения цепочки. НЕ удаляет их."""
-    global chain_message_ids, current_chain_text, current_chain_msg_id, last_chain_date
+    global chain_message_ids, current_chain_sections, current_chain_msg_id, last_chain_date
 
     for msg_id in chain_message_ids:
         try:
@@ -311,7 +323,7 @@ async def start_new_chain_day():
             print(f"Не удалось открепить {msg_id}: {e}")
 
     chain_message_ids = []
-    current_chain_text = ""
+    current_chain_sections = []
     current_chain_msg_id = None
     last_chain_date = today_msk_date()
 
