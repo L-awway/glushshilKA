@@ -5,7 +5,7 @@ import sqlite3
 from datetime import datetime, timezone, timedelta
 
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import Message, BotCommand, MenuButtonCommands
 from pyrogram.enums import ParseMode
 
 # ==== Конфиг ====
@@ -20,10 +20,16 @@ ANICARD_USERNAME = "anicardplaybot"
 DB_PATH = "anicard.db"
 INTERVAL_SECONDS = 15 * 60
 MSK = timezone(timedelta(hours=3))
-PINNED_SNAPSHOTS_LIMIT = 20  # сколько последних снапшотов показывать в закрепе
+
+MAX_MESSAGE_LEN = 3800  # запас до лимита Telegram 4096
 
 self_request = False
-pinned_message_id = None
+
+# цепочка сообщений дня
+chain_message_ids = []      # [msg_id_1, msg_id_2, ...]
+current_chain_text = ""     # буфер последнего сообщения
+current_chain_msg_id = None # id последнего сообщения
+last_chain_date = None      # дата цепочки
 
 userbot: Client = None
 bot: Client = None
@@ -35,6 +41,10 @@ def now_msk() -> datetime:
 
 def now_msk_str() -> str:
     return now_msk().strftime("%d.%m %H:%M")
+
+
+def today_msk_date():
+    return now_msk().date()
 
 
 # ==== БД ====
@@ -180,28 +190,6 @@ def get_delta_last_hour():
     return deltas
 
 
-def get_recent_snapshots(limit=PINNED_SNAPSHOTS_LIMIT):
-    """Возвращает последние N снапшотов, каждый как список изменений."""
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT DISTINCT ts FROM snapshots ORDER BY ts DESC LIMIT ?", (limit,))
-    timestamps = [row[0] for row in cur.fetchall()]
-    conn.close()
-
-    result = []
-    for ts in reversed(timestamps):  # от старых к новым
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT place, clan_name, points FROM snapshots WHERE ts = ? ORDER BY place",
-            (ts,),
-        )
-        rows = cur.fetchall()
-        conn.close()
-        result.append((ts, rows))
-    return result
-
-
 # ==== Парсинг ====
 CLAN_LINE_RE = re.compile(r"^(\d+)\.\s+(.+?)\s+-\s+(\d+)\s+🔹", re.MULTILINE)
 
@@ -213,67 +201,105 @@ def parse_top(text):
     ]
 
 
-# ==== Форматирование закрепа ====
-def format_pinned_message():
-    """Собирает текст закреплённого сообщения."""
-    top = get_current_top()
-    today = get_today_top()
-    recent = get_recent_snapshots()
-
-    parts = [f"📊 <b>Anicard — сводка</b> [{now_msk_str()} МСК]\n"]
-
-    # Топ сезона
-    parts.append("🏆 <b>Топ сезона:</b>")
-    for place, name, pts in top[:10]:
-        parts.append(f"  #{place} {name} — {pts}")
-
-    # Топ дня
-    if today:
-        parts.append("\n📈 <b>Топ дня (с 00:00):</b>")
-        for i, (name, d) in enumerate(today[:10], 1):
-            sign = "+" if d >= 0 else ""
-            parts.append(f"  {i}. {name} — {sign}{d}")
-
-    # Последние снапшоты
-    parts.append("\n⏱ <b>Последние обновления:</b>")
-    prev_top = None
-    for ts, rows in recent:
-        dt = datetime.fromisoformat(ts).astimezone(MSK).strftime("%H:%M")
-        # вычисляем дельты от предыдущего снапшота
-        cur_map = {name: (place, pts) for place, name, pts in rows}
-        if prev_top is None:
-            prev_top = cur_map
-            continue
-        deltas = []
-        for name, (place, pts) in cur_map.items():
-            if name in prev_top:
-                d = pts - prev_top[name][1]
-                if d != 0:
-                    deltas.append((place, name, d, pts))
-            else:
-                deltas.append((place, name, None, pts))
-        prev_top = cur_map
-        if deltas:
-            parts.append(f"\n📊 <b>[{dt} МСК]:</b>")
-            for place, name, d, pts in deltas:
-                if d is None:
-                    parts.append(f"  🆕 #{place} {name}: {pts}")
-                else:
-                    sign = "+" if d > 0 else ""
-                    parts.append(f"  📈 #{place} {name}: {sign}{d} ({pts})")
-
-    text = "\n".join(parts)
-    # Telegram limit 4096
-    if len(text) > 4000:
-        text = text[:3900] + "\n…(сообщение обрезано)"
-    return text
+# ==== Формат секции ====
+def format_snapshot_section(ts, deltas):
+    dt = datetime.fromisoformat(ts).astimezone(MSK).strftime("%H:%M")
+    lines = [f"📊 <b>[{dt} МСК]</b>"]
+    for place, name, kind, d, pts in deltas:
+        prefix = f"#{place}"
+        if kind == "delta":
+            sign = "+" if d > 0 else ""
+            lines.append(f"  📈 {prefix} {name}: {sign}{d} ({pts})")
+        elif kind == "return":
+            sign = "+" if d and d > 0 else ""
+            lines.append(f"  🔄 {prefix} {name}: вернулся, {sign}{d} ({pts})")
+        else:
+            lines.append(f"  🆕 {prefix} {name}: {pts}")
+    return "\n".join(lines)
 
 
-# ==== Userbot: обработка снапшота ====
+# ==== Цепочка сообщений ====
+async def append_to_chain(section: str):
+    global current_chain_text, current_chain_msg_id, last_chain_date
+
+    today = today_msk_date()
+    if last_chain_date is not None and last_chain_date != today:
+        await start_new_chain_day()
+    if last_chain_date is None:
+        last_chain_date = today
+
+    # первое сообщение дня
+    if current_chain_msg_id is None:
+        header = f"🗓 <b>История Anicard — {today.strftime('%d.%m.%Y')}</b>\n\n"
+        current_chain_text = header + section
+        try:
+            msg = await bot.send_message(
+                LEADER_CHAT_ID,
+                current_chain_text,
+                parse_mode=ParseMode.HTML,
+                protect_content=True,
+                disable_notification=True,
+            )
+            current_chain_msg_id = msg.id
+            chain_message_ids.append(msg.id)
+            await bot.pin_chat_message(LEADER_CHAT_ID, msg.id, disable_notification=True)
+        except Exception as e:
+            print(f"Не удалось создать сообщение цепочки: {e}")
+        return
+
+    new_text = current_chain_text + "\n\n" + section
+    if len(new_text) > MAX_MESSAGE_LEN:
+        # создаём новое сообщение и закрепляем
+        try:
+            msg = await bot.send_message(
+                LEADER_CHAT_ID,
+                section,
+                parse_mode=ParseMode.HTML,
+                protect_content=True,
+                disable_notification=True,
+            )
+            current_chain_msg_id = msg.id
+            current_chain_text = section
+            chain_message_ids.append(msg.id)
+            await bot.pin_chat_message(LEADER_CHAT_ID, msg.id, disable_notification=True)
+        except Exception as e:
+            print(f"Не удалось создать продолжение цепочки: {e}")
+    else:
+        current_chain_text = new_text
+        try:
+            await bot.edit_message_text(
+                chat_id=LEADER_CHAT_ID,
+                message_id=current_chain_msg_id,
+                text=current_chain_text,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            print(f"Не удалось отредактировать цепочку: {e}")
+
+
+async def start_new_chain_day():
+    """Открепляет все сообщения цепочки. НЕ удаляет их."""
+    global chain_message_ids, current_chain_text, current_chain_msg_id, last_chain_date
+
+    for msg_id in chain_message_ids:
+        try:
+            await bot.unpin_chat_message(LEADER_CHAT_ID, msg_id)
+        except Exception as e:
+            print(f"Не удалось открепить {msg_id}: {e}")
+
+    chain_message_ids = []
+    current_chain_text = ""
+    current_chain_msg_id = None
+    last_chain_date = today_msk_date()
+
+
+# ==== Обработка снапшота ====
 async def process_snapshot(text, source="плановый"):
     clans = parse_top(text)
     if not clans:
-        await userbot.send_message(OWNER_ID, f"⚠️ [{now_msk_str()} МСК] Не удалось распарсить топ ({source})")
+        await userbot.send_message(
+            OWNER_ID, f"⚠️ [{now_msk_str()} МСК] Не удалось распарсить топ ({source})"
+        )
         return
 
     print(f"[{now_msk_str()} МСК] Снапшот ({source}): {len(clans)} кланов")
@@ -286,22 +312,21 @@ async def process_snapshot(text, source="плановый"):
         if name in prev:
             d = pts - prev[name][1]
             if d != 0:
-                deltas.append((name, place, "delta", d, pts))
+                deltas.append((place, name, "delta", d, pts))
         elif name in history:
             d = pts - history[name][0]
-            deltas.append((name, place, "return", d, pts))
+            deltas.append((place, name, "return", d, pts))
         else:
-            deltas.append((name, place, "new", None, pts))
+            deltas.append((place, name, "new", None, pts))
 
     save_snapshot(clans)
 
-    # Личное уведомление владельцу
     if deltas:
         header = f"📊 Обновление топа [{now_msk_str()} МСК]"
         if source == "ручной":
             header += " 🔄 (ручной)"
         lines = [header + ":"]
-        for name, place, kind, d, pts in deltas:
+        for place, name, kind, d, pts in deltas:
             prefix = f"#{place}"
             if kind == "delta":
                 sign = "+" if d > 0 else ""
@@ -313,8 +338,8 @@ async def process_snapshot(text, source="плановый"):
                 lines.append(f"🆕 {prefix} {name}: {pts}")
         await userbot.send_message(OWNER_ID, "\n".join(lines))
 
-    # Обновляем закреп
-    await update_pinned_message()
+        section = format_snapshot_section(now_msk().isoformat(), deltas)
+        await append_to_chain(section)
 
 
 async def fetch_top_and_process(source="плановый"):
@@ -357,37 +382,9 @@ async def setup_userbot_listener():
         try:
             await process_snapshot(message.text, source="ручной")
         except Exception as e:
-            await userbot.send_message(OWNER_ID, f"⚠️ Ошибка ручного вызова [{now_msk_str()} МСК]: {e}")
-
-
-# ==== Закреп ====
-async def update_pinned_message():
-    global pinned_message_id
-    text = format_pinned_message()
-    try:
-        if pinned_message_id is None:
-            msg = await bot.send_message(
-                LEADER_CHAT_ID,
-                text,
-                parse_mode=ParseMode.HTML,
-                protect_content=True,
-                disable_notification=True,
+            await userbot.send_message(
+                OWNER_ID, f"⚠️ Ошибка ручного вызова [{now_msk_str()} МСК]: {e}"
             )
-            pinned_message_id = msg.id
-            await bot.pin_chat_message(
-                LEADER_CHAT_ID, pinned_message_id, disable_notification=True
-            )
-        else:
-            await bot.edit_message_text(
-                chat_id=LEADER_CHAT_ID,
-                message_id=pinned_message_id,
-                text=text,
-                parse_mode=ParseMode.HTML,
-            )
-    except Exception as e:
-        print(f"Не удалось обновить закреп: {e}")
-        # если сообщение удалили — создаём заново
-        pinned_message_id = None
 
 
 # ==== Бот: команды ====
@@ -479,7 +476,6 @@ async def setup_bot_handlers():
 
 # ==== 00:00 МСК ====
 async def daily_report_loop():
-    global pinned_message_id
     while True:
         now = now_msk()
         next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -494,7 +490,7 @@ async def daily_report_loop():
             lines = [f"🌙 <b>Итог дня [{now_msk_str()} МСК]</b>"]
             if today:
                 lines.append("\n📈 <b>Топ дня:</b>")
-                for i, (name, d) in enumerate(today[:10], 1):
+                for i, (name, d) in enumerate(today[:15], 1):
                     sign = "+" if d >= 0 else ""
                     lines.append(f"  {i}. {name} — {sign}{d}")
             else:
@@ -504,15 +500,11 @@ async def daily_report_loop():
             for place, name, pts in top[:10]:
                 lines.append(f"  #{place} {name} — {pts}")
 
-            await bot.send_message(LEADER_CHAT_ID, "\n".join(lines), parse_mode=ParseMode.HTML, protect_content=True)
+            await bot.send_message(
+                LEADER_CHAT_ID, "\n".join(lines), parse_mode=ParseMode.HTML, protect_content=True
+            )
 
-            # открепляем закреп
-            if pinned_message_id is not None:
-                try:
-                    await bot.unpin_chat_message(LEADER_CHAT_ID, pinned_message_id)
-                except Exception:
-                    pass
-                pinned_message_id = None
+            await start_new_chain_day()
 
         except Exception as e:
             await bot.send_message(LEADER_CHAT_ID, f"⚠️ Ошибка итогового отчёта: {e}")
@@ -541,6 +533,18 @@ async def main():
     await userbot.start()
     await bot.start()
 
+    # команды и меню
+    await bot.set_bot_commands([
+        BotCommand("top", "🏆 Топ кланов сезона"),
+        BotCommand("delta", "📊 Изменения за последний час"),
+        BotCommand("day", "📈 Топ кланов за сегодня"),
+        BotCommand("history", "📜 История конкретного клана"),
+    ])
+    try:
+        await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    except Exception as e:
+        print(f"Не удалось установить кнопку меню: {e}")
+
     await userbot.send_message(OWNER_ID, f"🟢 Userbot Anicard запущен [{now_msk_str()} МСК]")
     await setup_userbot_listener()
     await setup_bot_handlers()
@@ -548,7 +552,9 @@ async def main():
     try:
         await fetch_top_and_process(source="стартовый")
     except Exception as e:
-        await userbot.send_message(OWNER_ID, f"⚠️ Ошибка стартового парса [{now_msk_str()} МСК]: {e}")
+        await userbot.send_message(
+            OWNER_ID, f"⚠️ Ошибка стартового парса [{now_msk_str()} МСК]: {e}"
+        )
 
     asyncio.create_task(daily_report_loop())
 
