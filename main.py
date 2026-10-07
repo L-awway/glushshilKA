@@ -20,10 +20,10 @@ ANICARD_USERNAME = "anicardplaybot"
 DB_PATH = "anicard.db"
 INTERVAL_SECONDS = 15 * 60
 MSK = timezone(timedelta(hours=3))
+PINNED_SNAPSHOTS_LIMIT = 20  # сколько последних снапшотов показывать в закрепе
 
-# состояние
 self_request = False
-pinned_message_id = None  # id закреплённого сообщения в группе
+pinned_message_id = None
 
 userbot: Client = None
 bot: Client = None
@@ -105,7 +105,6 @@ def get_history():
 
 
 def get_current_top():
-    """Возвращает текущий топ из последнего снапшота: [(place, name, points), ...]"""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT MAX(ts) FROM snapshots")
@@ -123,36 +122,29 @@ def get_current_top():
 
 
 def get_today_top():
-    """Топ кланов по набранным очкам за сегодня (с 00:00 МСК)."""
     today_start = now_msk().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    # берём первый и последний снапшот за сегодня
     cur.execute(
         "SELECT clan_name, points, ts FROM snapshots WHERE ts >= ? ORDER BY ts",
         (today_start,),
     )
     rows = cur.fetchall()
     conn.close()
-
     if not rows:
         return []
-
-    # группируем: для каждого клана первое и последнее значение
     first = {}
     last = {}
     for name, pts, ts in rows:
         if name not in first:
             first[name] = pts
         last[name] = pts
-
     deltas = [(name, last[name] - first[name]) for name in last]
     deltas.sort(key=lambda x: x[1], reverse=True)
     return deltas
 
 
 def get_clan_history(clan_name: str):
-    """История клана за сегодня: [(ts, place, points), ...]"""
     today_start = now_msk().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -166,7 +158,6 @@ def get_clan_history(clan_name: str):
 
 
 def get_delta_last_hour():
-    """Изменения за последний час."""
     one_hour_ago = (now_msk() - timedelta(hours=1)).isoformat()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -176,20 +167,39 @@ def get_delta_last_hour():
     )
     rows = cur.fetchall()
     conn.close()
-
     if not rows:
         return []
-
     first = {}
     last = {}
     for name, pts, ts in rows:
         if name not in first:
             first[name] = pts
         last[name] = pts
-
     deltas = [(name, last[name] - first[name], last[name]) for name in last]
     deltas.sort(key=lambda x: x[1], reverse=True)
     return deltas
+
+
+def get_recent_snapshots(limit=PINNED_SNAPSHOTS_LIMIT):
+    """Возвращает последние N снапшотов, каждый как список изменений."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT ts FROM snapshots ORDER BY ts DESC LIMIT ?", (limit,))
+    timestamps = [row[0] for row in cur.fetchall()]
+    conn.close()
+
+    result = []
+    for ts in reversed(timestamps):  # от старых к новым
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT place, clan_name, points FROM snapshots WHERE ts = ? ORDER BY place",
+            (ts,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        result.append((ts, rows))
+    return result
 
 
 # ==== Парсинг ====
@@ -203,28 +213,63 @@ def parse_top(text):
     ]
 
 
-# ==== Форматирование сообщений для группы ====
+# ==== Форматирование закрепа ====
 def format_pinned_message():
-    """Формирует текст закреплённого сообщения."""
+    """Собирает текст закреплённого сообщения."""
     top = get_current_top()
     today = get_today_top()
+    recent = get_recent_snapshots()
 
-    lines = [f"📊 <b>Anicard — сводка</b> [{now_msk_str()} МСК]\n"]
+    parts = [f"📊 <b>Anicard — сводка</b> [{now_msk_str()} МСК]\n"]
 
-    lines.append("🏆 <b>Топ сезона:</b>")
+    # Топ сезона
+    parts.append("🏆 <b>Топ сезона:</b>")
     for place, name, pts in top[:10]:
-        lines.append(f"  #{place} {name} — {pts}")
+        parts.append(f"  #{place} {name} — {pts}")
 
+    # Топ дня
     if today:
-        lines.append("\n📈 <b>Топ дня (набрано с 00:00):</b>")
+        parts.append("\n📈 <b>Топ дня (с 00:00):</b>")
         for i, (name, d) in enumerate(today[:10], 1):
             sign = "+" if d >= 0 else ""
-            lines.append(f"  {i}. {name} — {sign}{d}")
+            parts.append(f"  {i}. {name} — {sign}{d}")
 
-    return "\n".join(lines)
+    # Последние снапшоты
+    parts.append("\n⏱ <b>Последние обновления:</b>")
+    prev_top = None
+    for ts, rows in recent:
+        dt = datetime.fromisoformat(ts).astimezone(MSK).strftime("%H:%M")
+        # вычисляем дельты от предыдущего снапшота
+        cur_map = {name: (place, pts) for place, name, pts in rows}
+        if prev_top is None:
+            prev_top = cur_map
+            continue
+        deltas = []
+        for name, (place, pts) in cur_map.items():
+            if name in prev_top:
+                d = pts - prev_top[name][1]
+                if d != 0:
+                    deltas.append((place, name, d, pts))
+            else:
+                deltas.append((place, name, None, pts))
+        prev_top = cur_map
+        if deltas:
+            parts.append(f"\n📊 <b>[{dt} МСК]:</b>")
+            for place, name, d, pts in deltas:
+                if d is None:
+                    parts.append(f"  🆕 #{place} {name}: {pts}")
+                else:
+                    sign = "+" if d > 0 else ""
+                    parts.append(f"  📈 #{place} {name}: {sign}{d} ({pts})")
+
+    text = "\n".join(parts)
+    # Telegram limit 4096
+    if len(text) > 4000:
+        text = text[:3900] + "\n…(сообщение обрезано)"
+    return text
 
 
-# ==== Логика userbot ====
+# ==== Userbot: обработка снапшота ====
 async def process_snapshot(text, source="плановый"):
     clans = parse_top(text)
     if not clans:
@@ -250,7 +295,7 @@ async def process_snapshot(text, source="плановый"):
 
     save_snapshot(clans)
 
-    # личное уведомление владельцу
+    # Личное уведомление владельцу
     if deltas:
         header = f"📊 Обновление топа [{now_msk_str()} МСК]"
         if source == "ручной":
@@ -268,7 +313,7 @@ async def process_snapshot(text, source="плановый"):
                 lines.append(f"🆕 {prefix} {name}: {pts}")
         await userbot.send_message(OWNER_ID, "\n".join(lines))
 
-    # обновляем закреплённое сообщение в группе лидеров
+    # Обновляем закреп
     await update_pinned_message()
 
 
@@ -315,13 +360,12 @@ async def setup_userbot_listener():
             await userbot.send_message(OWNER_ID, f"⚠️ Ошибка ручного вызова [{now_msk_str()} МСК]: {e}")
 
 
-# ==== Работа с закреплённым сообщением ====
+# ==== Закреп ====
 async def update_pinned_message():
     global pinned_message_id
     text = format_pinned_message()
     try:
         if pinned_message_id is None:
-            # создаём новое сообщение
             msg = await bot.send_message(
                 LEADER_CHAT_ID,
                 text,
@@ -330,12 +374,10 @@ async def update_pinned_message():
                 disable_notification=True,
             )
             pinned_message_id = msg.id
-            # закрепляем без уведомления
             await bot.pin_chat_message(
                 LEADER_CHAT_ID, pinned_message_id, disable_notification=True
             )
         else:
-            # редактируем существующее
             await bot.edit_message_text(
                 chat_id=LEADER_CHAT_ID,
                 message_id=pinned_message_id,
@@ -344,11 +386,12 @@ async def update_pinned_message():
             )
     except Exception as e:
         print(f"Не удалось обновить закреп: {e}")
+        # если сообщение удалили — создаём заново
+        pinned_message_id = None
 
 
-# ==== Бот для лидеров: команды ====
+# ==== Бот: команды ====
 async def setup_bot_handlers():
-    # проверка: только наша группа
     def only_our_chat(_, __, message: Message):
         return message.chat.id == LEADER_CHAT_ID
 
@@ -361,11 +404,7 @@ async def setup_bot_handlers():
         lines = [f"🏆 <b>Топ сезона</b> [{now_msk_str()} МСК]:"]
         for place, name, pts in top[:10]:
             lines.append(f"#{place} {name} — {pts}")
-        await message.reply_text(
-            "\n".join(lines),
-            parse_mode=ParseMode.HTML,
-            protect_content=True,
-        )
+        await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, protect_content=True)
 
     @bot.on_message(filters.command("delta", prefixes="/") & filters.create(only_our_chat))
     async def cmd_delta(client, message: Message):
@@ -377,13 +416,9 @@ async def setup_bot_handlers():
         for name, d, pts in deltas:
             sign = "+" if d > 0 else ""
             lines.append(f"{name}: {sign}{d} ({pts})")
-        await message.reply_text(
-            "\n".join(lines),
-            parse_mode=ParseMode.HTML,
-            protect_content=True,
-        )
+        await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, protect_content=True)
 
-    @bot.on_message(filters.command("day", prefixes="/") & filters.create(only_our_chat))
+    @bot.on_message(filters.command(["day", "топдня"], prefixes="/") & filters.create(only_our_chat))
     async def cmd_day(client, message: Message):
         today = get_today_top()
         if not today:
@@ -393,30 +428,22 @@ async def setup_bot_handlers():
         for i, (name, d) in enumerate(today[:15], 1):
             sign = "+" if d >= 0 else ""
             lines.append(f"{i}. {name} — {sign}{d}")
-        await message.reply_text(
-            "\n".join(lines),
-            parse_mode=ParseMode.HTML,
-            protect_content=True,
-        )
+        await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, protect_content=True)
 
-    @bot.on_message(filters.command("history", prefixes="/") & filters.create(only_our_chat))
+    @bot.on_message(filters.command(["history", "история"], prefixes="/") & filters.create(only_our_chat))
     async def cmd_history(client, message: Message):
-        # /history Название клана
         parts = message.text.split(maxsplit=1)
         if len(parts) < 2:
             await message.reply_text("Использование: /history <название клана>")
             return
         clan_query = parts[1].strip()
-        # ищем клан по частичному совпадению
         history_all = get_history()
         matches = [n for n in history_all if clan_query.lower() in n.lower()]
         if not matches:
             await message.reply_text(f"Клан «{clan_query}» не найден в истории.")
             return
         if len(matches) > 1:
-            await message.reply_text(
-                "Найдено несколько кланов:\n" + "\n".join(matches[:10])
-            )
+            await message.reply_text("Найдено несколько кланов:\n" + "\n".join(matches[:10]))
             return
 
         clan_name = matches[0]
@@ -444,31 +471,27 @@ async def setup_bot_handlers():
                     lines.append(f"  {dt} — #{place}, {pts} ({diff:+d})")
             prev_pts = pts
 
-        # обрезаем, если слишком длинно
         text = "\n".join(lines)
         if len(text) > 4000:
             text = text[:3900] + "\n…(сообщение обрезано)"
         await message.reply_text(text, parse_mode=ParseMode.HTML, protect_content=True)
 
 
-# ==== Планировщик 00:00 МСК ====
+# ==== 00:00 МСК ====
 async def daily_report_loop():
-    """Ждёт 00:00 МСК и отправляет итоговый отчёт."""
+    global pinned_message_id
     while True:
         now = now_msk()
-        next_midnight = (now + timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         wait_seconds = (next_midnight - now).total_seconds()
         print(f"До итогового отчёта: {wait_seconds:.0f} сек")
         await asyncio.sleep(wait_seconds)
 
         try:
-            # итог дня
             today = get_today_top()
             top = get_current_top()
 
-            lines = ["🌙 <b>Итог дня</b> (за прошедшие сутки):"]
+            lines = [f"🌙 <b>Итог дня [{now_msk_str()} МСК]</b>"]
             if today:
                 lines.append("\n📈 <b>Топ дня:</b>")
                 for i, (name, d) in enumerate(today[:10], 1):
@@ -481,15 +504,9 @@ async def daily_report_loop():
             for place, name, pts in top[:10]:
                 lines.append(f"  #{place} {name} — {pts}")
 
-            await bot.send_message(
-                LEADER_CHAT_ID,
-                "\n".join(lines),
-                parse_mode=ParseMode.HTML,
-                protect_content=True,
-            )
+            await bot.send_message(LEADER_CHAT_ID, "\n".join(lines), parse_mode=ParseMode.HTML, protect_content=True)
 
-            # открепляем старое закреплённое сообщение
-            global pinned_message_id
+            # открепляем закреп
             if pinned_message_id is not None:
                 try:
                     await bot.unpin_chat_message(LEADER_CHAT_ID, pinned_message_id)
@@ -498,9 +515,7 @@ async def daily_report_loop():
                 pinned_message_id = None
 
         except Exception as e:
-            await bot.send_message(
-                LEADER_CHAT_ID, f"⚠️ Ошибка итогового отчёта: {e}"
-            )
+            await bot.send_message(LEADER_CHAT_ID, f"⚠️ Ошибка итогового отчёта: {e}")
 
 
 # ==== Запуск ====
@@ -530,16 +545,13 @@ async def main():
     await setup_userbot_listener()
     await setup_bot_handlers()
 
-    # стартовый парс
     try:
         await fetch_top_and_process(source="стартовый")
     except Exception as e:
         await userbot.send_message(OWNER_ID, f"⚠️ Ошибка стартового парса [{now_msk_str()} МСК]: {e}")
 
-    # запускаем фоновые задачи
     asyncio.create_task(daily_report_loop())
 
-    # плановый цикл
     while True:
         await asyncio.sleep(INTERVAL_SECONDS)
         try:
