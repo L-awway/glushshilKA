@@ -203,30 +203,9 @@ def parse_top(text):
 
 # ==== Формат секции ====
 def format_snapshot_section(ts, deltas):
+    """Только секция снапшота — без топа сезона и дня."""
     dt = datetime.fromisoformat(ts).astimezone(MSK).strftime("%H:%M")
-
     lines = [f"📊 <b>[{dt} МСК]</b>"]
-
-    # Топ сезона (топ-10)
-    top = get_current_top()
-    if top:
-        lines.append("")
-        lines.append("🏆 <b>Топ сезона:</b>")
-        for place, name, pts in top[:10]:
-            lines.append(f"  #{place} {name} — {pts}")
-
-    # Топ дня (топ-10)
-    today = get_today_top()
-    if today:
-        lines.append("")
-        lines.append("📈 <b>Топ дня (с 00:00):</b>")
-        for i, (name, d) in enumerate(today[:10], 1):
-            sign = "+" if d >= 0 else ""
-            lines.append(f"  {i}. {name} — {sign}{d}")
-
-    # Изменения за 15 минут
-    lines.append("")
-    lines.append("⏱ <b>Изменения за 15 мин:</b>")
     for place, name, kind, d, pts in deltas:
         prefix = f"#{place}"
         if kind == "delta":
@@ -237,6 +216,25 @@ def format_snapshot_section(ts, deltas):
             lines.append(f"  🔄 {prefix} {name}: вернулся, {sign}{d} ({pts})")
         else:
             lines.append(f"  🆕 {prefix} {name}: {pts}")
+    return "\n".join(lines)
+
+
+def format_header():
+    """Шапка: топ сезона + топ дня на текущий момент."""
+    lines = []
+    top = get_current_top()
+    if top:
+        lines.append("🏆 <b>Топ сезона:</b>")
+        for place, name, pts in top[:10]:
+            lines.append(f"  #{place} {name} — {pts}")
+
+    today = get_today_top()
+    if today:
+        lines.append("")
+        lines.append("📈 <b>Топ дня (с 00:00):</b>")
+        for i, (name, d) in enumerate(today[:10], 1):
+            sign = "+" if d >= 0 else ""
+            lines.append(f"  {i}. {name} — {sign}{d}")
 
     return "\n".join(lines)
 
@@ -250,10 +248,11 @@ async def append_to_chain(section: str):
     if last_chain_date is None:
         last_chain_date = today
 
-    # первое сообщение дня
+    # первое сообщение дня — с шапкой
     if current_chain_msg_id is None:
-        header = f"🗓 <b>История Anicard — {today.strftime('%d.%m.%Y')}</b>\n\n"
-        current_chain_text = header + section
+        header_date = f"🗓 <b>История Anicard — {today.strftime('%d.%m.%Y')}</b>"
+        header = format_header()
+        current_chain_text = f"{header_date}\n\n{header}\n\n{section}"
         try:
             msg = await bot.send_message(
                 LEADER_CHAT_ID,
@@ -271,17 +270,20 @@ async def append_to_chain(section: str):
 
     new_text = current_chain_text + "\n\n" + section
     if len(new_text) > MAX_MESSAGE_LEN:
-        # создаём новое сообщение и закрепляем
+        # создаём новое сообщение — снова с шапкой
+        header_date = f"🗓 <b>История Anicard — {today.strftime('%d.%m.%Y')} (продолжение)</b>"
+        header = format_header()
+        new_text = f"{header_date}\n\n{header}\n\n{section}"
         try:
             msg = await bot.send_message(
                 LEADER_CHAT_ID,
-                section,
+                new_text,
                 parse_mode=ParseMode.HTML,
                 protect_content=True,
                 disable_notification=True,
             )
             current_chain_msg_id = msg.id
-            current_chain_text = section
+            current_chain_text = new_text
             chain_message_ids.append(msg.id)
             await bot.pin_chat_message(LEADER_CHAT_ID, msg.id, disable_notification=True)
         except Exception as e:
@@ -297,7 +299,6 @@ async def append_to_chain(section: str):
             )
         except Exception as e:
             print(f"Не удалось отредактировать цепочку: {e}")
-
 
 async def start_new_chain_day():
     """Открепляет все сообщения цепочки. НЕ удаляет их."""
